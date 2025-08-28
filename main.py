@@ -1,15 +1,18 @@
+# main.py
 import os
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import streamlit as st
-from firebase_admin import credentials, initialize_app
-from google.cloud import firestore
+import firebase_admin
+from firebase_admin import credentials
+from firebase_admin import firestore as admin_firestore
+
 from streamlit_folium import st_folium
 import folium
 
 # -------------------------------
-# Page config (mobile + desktop)
+# Page config (mobile & desktop)
 # -------------------------------
 st.set_page_config(
     page_title="My Live Location",
@@ -20,107 +23,162 @@ st.set_page_config(
 # -------------------------------
 # Auto-refresh every 2 minutes
 # -------------------------------
-# Prefer built-in autorefresh helper from streamlit >=1.31
+# Try the helper package; if missing, fall back to a JS refresh.
 try:
-    from streamlit_autorefresh import st_autorefresh  # pip: streamlit-autorefresh
+    from streamlit_autorefresh import st_autorefresh  # pip install streamlit-autorefresh
     st_autorefresh(interval=120_000, key="auto_refresh_2min")
 except Exception:
-    # Fallback: a tiny JS-based refresh (works on most installs)
     st.markdown(
         """
         <script>
-        setTimeout(function(){ window.location.reload(); }, 120000);
+          setTimeout(function(){ location.reload(); }, 120000);
         </script>
         """,
         unsafe_allow_html=True,
     )
 
 # -------------------------------
-# Secrets / configuration
+# Secrets / Configuration
 # -------------------------------
-SECRETS = st.secrets
-
-# Firebase Admin dict (taken from .streamlit/secrets.toml)
-fb = {
-    "type": SECRETS["FIREBASE_TYPE"],
-    "project_id": SECRETS["FIREBASE_PROJECT_ID"],
-    "private_key_id": SECRETS["FIREBASE_PRIVATE_KEY_ID"],
-    "private_key": SECRETS["FIREBASE_PRIVATE_KEY"].replace("\\n", "\n"),
-    "client_email": SECRETS["FIREBASE_CLIENT_EMAIL"],
-    "client_id": SECRETS["FIREBASE_CLIENT_ID"],
-    "auth_uri": SECRETS["FIREBASE_AUTH_URI"],
-    "token_uri": SECRETS["FIREBASE_TOKEN_URI"],
-    "auth_provider_x509_cert_url": SECRETS["FIREBASE_AUTH_PROVIDER_X509_CERT_URL"],
-    "client_x509_cert_url": SECRETS["FIREBASE_CLIENT_X509_CERT_URL"],
-    "universe_domain": SECRETS["FIREBASE_UNIVERSE_DOMAIN"],
+S = st.secrets
+FIREBASE_DICT = {
+    "type": S["FIREBASE_TYPE"],
+    "project_id": S["FIREBASE_PROJECT_ID"],
+    "private_key_id": S["FIREBASE_PRIVATE_KEY_ID"],
+    "private_key": S["FIREBASE_PRIVATE_KEY"].replace("\\n", "\n"),
+    "client_email": S["FIREBASE_CLIENT_EMAIL"],
+    "client_id": S["FIREBASE_CLIENT_ID"],
+    "auth_uri": S["FIREBASE_AUTH_URI"],
+    "token_uri": S["FIREBASE_TOKEN_URI"],
+    "auth_provider_x509_cert_url": S["FIREBASE_AUTH_PROVIDER_X509_CERT_URL"],
+    "client_x509_cert_url": S["FIREBASE_CLIENT_X509_CERT_URL"],
+    "universe_domain": S.get("FIREBASE_UNIVERSE_DOMAIN", "googleapis.com"),
 }
 
-SUPER_ADMIN_EMAIL = SECRETS.get("SUPER_ADMIN_EMAIL", "")
-TOM_ICON_URL = SECRETS.get("TOM_ICON_URL", "")  # optional custom marker image (png)
+# Who to fetch
+USER_EMAIL = S.get("SUPER_ADMIN_EMAIL", "").strip()
+
+# Optional overrides / visuals
+FORCE_DEVICE_ID = S.get("FORCE_DEVICE_ID", "").strip()         # if you want to pin a device
+TOM_ICON_URL   = S.get("TOM_ICON_URL", "").strip()             # PNG for Tom marker (48x48 works well)
 
 # -------------------------------
-# Firebase init (singleton)
+# Firebase Admin init (singleton)
 # -------------------------------
 @st.cache_resource(show_spinner=False)
 def get_firestore_client():
-    if not initialize_app._apps:  # avoid re-init in some environments
-        cred = credentials.Certificate(fb)
-        initialize_app(cred, {"projectId": fb["project_id"]})
-    return firestore.Client(project=fb["project_id"])
+    # Initialize once, safely across Streamlit reruns
+    try:
+        firebase_admin.get_app()
+    except ValueError:
+        cred = credentials.Certificate(FIREBASE_DICT)
+        firebase_admin.initialize_app(cred, {"projectId": FIREBASE_DICT["project_id"]})
+    return admin_firestore.client()
 
 db = get_firestore_client()
 
 # -------------------------------
-# Helpers
+# Time helpers
 # -------------------------------
 IST = ZoneInfo("Asia/Kolkata")
 
-def fmt_ist(ms_epoch: int) -> str:
-    """Convert epoch milliseconds to IST pretty string."""
-    dt = datetime.fromtimestamp(ms_epoch / 1000, tz=timezone.utc).astimezone(IST)
+def ms_to_ist_str(ms: int) -> str:
+    """Epoch ms -> 'DD Mon YYYY, HH:MM:SS AM/PM IST'"""
+    if not ms:
+        return "—"
+    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone(IST)
     return dt.strftime("%d %b %Y, %I:%M:%S %p IST")
 
-def get_latest_location_for_email(email: str):
-    """
-    Resolve the user doc by email, then find a device and fetch the newest
-    document from its 'locations' subcollection.
-    Returns dict: {lat, lng, timestamp_ms, device_id} or None.
-    """
-    # 1) Find user doc by email (field)
-    users_ref = db.collection("users").where("email", "==", email).limit(1)
-    snap = users_ref.stream()
-    user_doc = next(snap, None)
-    if not user_doc:
-        return None
+# -------------------------------
+# Firestore fetch helpers
+# -------------------------------
+def email_to_safe_id(email: str) -> str:
+    """Fallback: build doc id like 'name_at_domain_dot_com' if needed."""
+    return (
+        email.replace("@", "_at_")
+        .replace(".", "_dot_")
+        .replace("+", "_plus_")
+        .replace("-", "_dash_")
+    )
 
-    user_ref = db.collection("users").document(user_doc.id)
+def resolve_user_doc_by_email(email: str):
+    """
+    Prefer a field query on 'email'. If missing, fall back to docId pattern.
+    Returns (user_doc_id, user_ref) or (None, None).
+    """
+    # Try field query
+    q = db.collection("users").where("email", "==", email).limit(1).stream()
+    doc = next(q, None)
+    if doc:
+        return doc.id, db.collection("users").document(doc.id)
 
-    # 2) Choose device: newest by a metadata field if available; else just first
+    # Fallback to doc id convention
+    guess_id = email_to_safe_id(email)
+    guess_ref = db.collection("users").document(guess_id)
+    snap = guess_ref.get()
+    if snap.exists:
+        return guess_id, guess_ref
+
+    return None, None
+
+def pick_device_ref(user_ref):
+    """
+    Choose a device document for the user.
+    Priority:
+      1) FORCE_DEVICE_ID (if provided and exists)
+      2) Device with highest 'lastUpdated' field
+      3) Otherwise, first device found
+    Returns (device_id, device_ref) or (None, None)
+    """
     devices_ref = user_ref.collection("devices")
     devices = list(devices_ref.stream())
     if not devices:
+        return None, None
+
+    if FORCE_DEVICE_ID:
+        for d in devices:
+            if d.id == FORCE_DEVICE_ID:
+                return d.id, devices_ref.document(d.id)
+
+    # Sort by 'lastUpdated' desc if present
+    def last_updated(doc):
+        data = doc.to_dict() or {}
+        return int(data.get("lastUpdated", 0))
+
+    devices.sort(key=last_updated, reverse=True)
+    chosen = devices[0]
+    return chosen.id, devices_ref.document(chosen.id)
+
+def fetch_latest_location(user_email: str):
+    """
+    Resolve user -> device -> latest location by 'timestamp' DESC.
+    Returns dict {lat, lng, timestamp_ms, device_id} or None.
+    """
+    user_id, user_ref = resolve_user_doc_by_email(user_email)
+    if not user_ref:
         return None
 
-    # Try to choose the device with the most recent 'lastUpdated' or else first
-    def device_last_updated(doc):
-        data = doc.to_dict() or {}
-        return int(data.get("lastUpdated", 0))  # epoch ms if present
+    device_id, device_ref = pick_device_ref(user_ref)
+    if not device_ref:
+        return None
 
-    devices.sort(key=device_last_updated, reverse=True)
-    chosen_device = devices[0]
-    device_id = chosen_device.id
-
-    # 3) Latest location (order by 'timestamp' desc)
-    loc_ref = user_ref.collection("devices").document(device_id).collection("locations")
-    latest_q = loc_ref.order_by("timestamp", direction=firestore.Query.DESCENDING).limit(1)
-    latest = list(latest_q.stream())
+    loc_ref = device_ref.collection("locations")
+    latest = list(
+        loc_ref.order_by("timestamp", direction=admin_firestore.Query.DESCENDING).limit(1).stream()
+    )
     if not latest:
         return None
 
-    loc = latest[0].to_dict()
+    loc = latest[0].to_dict() or {}
+    try:
+        lat = float(loc["latitude"])
+        lng = float(loc["longitude"])
+    except Exception:
+        return None
+
     return {
-        "lat": float(loc["latitude"]),
-        "lng": float(loc["longitude"]),
+        "lat": lat,
+        "lng": lng,
         "timestamp_ms": int(loc.get("timestamp", 0)),
         "device_id": device_id,
     }
@@ -128,48 +186,52 @@ def get_latest_location_for_email(email: str):
 # -------------------------------
 # UI
 # -------------------------------
-title_left, time_right = st.columns([0.65, 0.35])
-with title_left:
+header_left, header_right = st.columns([0.66, 0.34])
+
+with header_left:
     st.markdown("## 🧭 My Live Location")
 
-with time_right:
+with header_right:
     st.markdown(
-        """
-        <div style="text-align:right; font-size:0.95rem; opacity:0.85;">
-            Auto-refresh: every 2 minutes
-        </div>
-        """,
+        "<div style='text-align:right; opacity:0.85;'>Auto-refresh: every 2 minutes</div>",
         unsafe_allow_html=True,
     )
 
-with st.spinner("Fetching latest location from Firestore…"):
-    info = get_latest_location_for_email(SUPER_ADMIN_EMAIL)
-
-if not info:
-    st.error("Couldn't find a location record. Please verify Firestore data and email in secrets.")
+if not USER_EMAIL:
+    st.error("SUPER_ADMIN_EMAIL is missing in secrets.")
     st.stop()
 
-# Last updated (IST)
-last_updated_str = fmt_ist(info["timestamp_ms"])
-right_col = st.columns([0.6, 0.4])[1]
-with right_col:
-    st.markdown(
-        f"""
-        <div style="text-align:right; font-size:1rem;">
-            <strong>Last updated:</strong> {last_updated_str}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+with st.spinner("Fetching latest location from Firestore…"):
+    latest = fetch_latest_location(USER_EMAIL)
+
+if not latest:
+    st.error("No location found. Check Firestore paths/fields and your email in secrets.")
+    st.stop()
+
+# Last updated (IST) in the top-right
+last_updated = ms_to_ist_str(latest["timestamp_ms"])
+st.markdown(
+    f"""
+    <div style="text-align:right; font-size:1rem; margin-top:-0.5rem;">
+      <strong>Last updated:</strong> {last_updated}
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 # -------------------------------
-# Map (Folium + OpenStreetMap)
+# Map rendering
 # -------------------------------
-lat, lng = info["lat"], info["lng"]
+lat, lng = latest["lat"], latest["lng"]
 
-m = folium.Map(location=[lat, lng], zoom_start=16, tiles="OpenStreetMap", control_scale=True)
+m = folium.Map(
+    location=[lat, lng],
+    zoom_start=16,
+    tiles="OpenStreetMap",
+    control_scale=True,
+)
 
-# Tom icon if provided, else a clean default marker
+# Tom icon if provided; else a standard user marker
 try:
     if TOM_ICON_URL:
         icon = folium.CustomIcon(TOM_ICON_URL, icon_size=(48, 48))
@@ -183,12 +245,12 @@ try:
 except Exception:
     folium.Marker([lat, lng], tooltip="You are here").add_to(m)
 
-# Show map (fits both mobile & desktop nicely)
 st_folium(m, height=520, width=None)
-st.caption(f"Device: {info['device_id']}")
+st.caption(f"Device: {latest['device_id']}")
 
-# Minimal footer (mobile-friendly)
 st.markdown(
-    "<div style='text-align:center; opacity:0.6; font-size:0.9rem;'>Data source: Firestore · Tiles: OpenStreetMap</div>",
+    "<div style='text-align:center; opacity:0.6; font-size:0.9rem;'>"
+    "Data source: Firestore · Tiles: OpenStreetMap"
+    "</div>",
     unsafe_allow_html=True,
 )
