@@ -1,0 +1,6 @@
+streamlit>=1.33
+firebase-admin>=6.5.0
+google-cloud-firestore>=2.16.0
+folium>=0.17.0
+streamlit-folium>=0.18.0
+streamlit-autorefresh>=1.0.1
