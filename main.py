@@ -1,46 +1,35 @@
 # main.py
-import os
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+import base64, tempfile
 
 import streamlit as st
 import firebase_admin
 from firebase_admin import credentials
 from firebase_admin import firestore as admin_firestore
-
-from streamlit_folium import st_folium
 import folium
+from streamlit_folium import st_folium
 
 # -------------------------------
-# Page config (mobile & desktop)
+# Page config
 # -------------------------------
-st.set_page_config(
-    page_title="My Live Location",
-    page_icon="🗺️",
-    layout="wide",
-)
+st.set_page_config(page_title="Family Live Locations", page_icon="📍", layout="wide")
 
-# -------------------------------
 # Auto-refresh every 2 minutes
-# -------------------------------
-# Try the helper package; if missing, fall back to a JS refresh.
 try:
     from streamlit_autorefresh import st_autorefresh  # pip install streamlit-autorefresh
-    st_autorefresh(interval=120_000, key="auto_refresh_2min")
+    st_autorefresh(interval=120_000, key="auto_refresh_2m")
 except Exception:
     st.markdown(
-        """
-        <script>
-          setTimeout(function(){ location.reload(); }, 120000);
-        </script>
-        """,
+        "<script>setTimeout(()=>location.reload(),120000);</script>",
         unsafe_allow_html=True,
     )
 
-# -------------------------------
-# Secrets / Configuration
-# -------------------------------
 S = st.secrets
+
+# -------------------------------
+# Firebase Admin init (singleton)
+# -------------------------------
 FIREBASE_DICT = {
     "type": S["FIREBASE_TYPE"],
     "project_id": S["FIREBASE_PROJECT_ID"],
@@ -55,19 +44,8 @@ FIREBASE_DICT = {
     "universe_domain": S.get("FIREBASE_UNIVERSE_DOMAIN", "googleapis.com"),
 }
 
-# Who to fetch
-USER_EMAIL = S.get("SUPER_ADMIN_EMAIL", "").strip()
-
-# Optional overrides / visuals
-FORCE_DEVICE_ID = S.get("FORCE_DEVICE_ID", "").strip()         # if you want to pin a device
-TOM_ICON_URL   = S.get("TOM_ICON_URL", "").strip()             # PNG for Tom marker (48x48 works well)
-
-# -------------------------------
-# Firebase Admin init (singleton)
-# -------------------------------
 @st.cache_resource(show_spinner=False)
-def get_firestore_client():
-    # Initialize once, safely across Streamlit reruns
+def get_db():
     try:
         firebase_admin.get_app()
     except ValueError:
@@ -75,182 +53,205 @@ def get_firestore_client():
         firebase_admin.initialize_app(cred, {"projectId": FIREBASE_DICT["project_id"]})
     return admin_firestore.client()
 
-db = get_firestore_client()
-
-# -------------------------------
-# Time helpers
-# -------------------------------
+db = get_db()
 IST = ZoneInfo("Asia/Kolkata")
 
-def ms_to_ist_str(ms: int) -> str:
-    """Epoch ms -> 'DD Mon YYYY, HH:MM:SS AM/PM IST'"""
+def ms_to_ist(ms: int) -> str:
     if not ms:
         return "—"
-    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone(IST)
-    return dt.strftime("%d %b %Y, %I:%M:%S %p IST")
+    return datetime.fromtimestamp(ms/1000, tz=timezone.utc).astimezone(IST)\
+        .strftime("%d %b %Y, %I:%M:%S %p IST")
 
 # -------------------------------
-# Firestore fetch helpers
+# Firestore helpers
 # -------------------------------
 def email_to_safe_id(email: str) -> str:
-    """Fallback: build doc id like 'name_at_domain_dot_com' if needed."""
-    return (
-        email.replace("@", "_at_")
-        .replace(".", "_dot_")
-        .replace("+", "_plus_")
-        .replace("-", "_dash_")
-    )
+    return (email.replace("@","_at_")
+                 .replace(".","_dot_")
+                 .replace("+","_plus_")
+                 .replace("-","_dash_"))
 
-def resolve_user_doc_by_email(email: str):
-    """
-    Prefer a field query on 'email'. If missing, fall back to docId pattern.
-    Returns (user_doc_id, user_ref) or (None, None).
-    """
-    # Try field query
+def resolve_user_ref_by_email(email: str):
+    # Try field query on "email"
     q = db.collection("users").where("email", "==", email).limit(1).stream()
     doc = next(q, None)
     if doc:
-        return doc.id, db.collection("users").document(doc.id)
+        return db.collection("users").document(doc.id)
 
-    # Fallback to doc id convention
-    guess_id = email_to_safe_id(email)
-    guess_ref = db.collection("users").document(guess_id)
-    snap = guess_ref.get()
-    if snap.exists:
-        return guess_id, guess_ref
+    # Fallback to doc-id convention
+    guess = db.collection("users").document(email_to_safe_id(email))
+    if guess.get().exists:
+        return guess
+    return None
 
-    return None, None
-
-def pick_device_ref(user_ref):
-    """
-    Choose a device document for the user.
-    Priority:
-      1) FORCE_DEVICE_ID (if provided and exists)
-      2) Device with highest 'lastUpdated' field
-      3) Otherwise, first device found
-    Returns (device_id, device_ref) or (None, None)
-    """
+def pick_device_ref(user_ref, forced_id: str | None = None):
     devices_ref = user_ref.collection("devices")
     devices = list(devices_ref.stream())
     if not devices:
-        return None, None
+        return None
 
-    if FORCE_DEVICE_ID:
+    if forced_id:
         for d in devices:
-            if d.id == FORCE_DEVICE_ID:
-                return d.id, devices_ref.document(d.id)
+            if d.id == forced_id:
+                return devices_ref.document(d.id)
 
-    # Sort by 'lastUpdated' desc if present
-    def last_updated(doc):
-        data = doc.to_dict() or {}
-        return int(data.get("lastUpdated", 0))
+    # sort by lastUpdated desc if present
+    devices.sort(key=lambda d: int((d.to_dict() or {}).get("lastUpdated", 0)), reverse=True)
+    return devices_ref.document(devices[0].id)
 
-    devices.sort(key=last_updated, reverse=True)
-    chosen = devices[0]
-    return chosen.id, devices_ref.document(chosen.id)
-
-def fetch_latest_location(user_email: str):
-    """
-    Resolve user -> device -> latest location by 'timestamp' DESC.
-    Returns dict {lat, lng, timestamp_ms, device_id} or None.
-    """
-    user_id, user_ref = resolve_user_doc_by_email(user_email)
+def fetch_latest_location(email: str, force_device_id: str | None = None):
+    user_ref = resolve_user_ref_by_email(email)
     if not user_ref:
         return None
 
-    device_id, device_ref = pick_device_ref(user_ref)
+    device_ref = pick_device_ref(user_ref, force_device_id)
     if not device_ref:
         return None
 
     loc_ref = device_ref.collection("locations")
-    latest = list(
-        loc_ref.order_by("timestamp", direction=admin_firestore.Query.DESCENDING).limit(1).stream()
-    )
+    latest = list(loc_ref.order_by("timestamp", direction=admin_firestore.Query.DESCENDING)
+                        .limit(1).stream())
     if not latest:
         return None
 
-    loc = latest[0].to_dict() or {}
+    d = latest[0].to_dict() or {}
     try:
-        lat = float(loc["latitude"])
-        lng = float(loc["longitude"])
+        lat, lng = float(d["latitude"]), float(d["longitude"])
     except Exception:
         return None
 
     return {
         "lat": lat,
         "lng": lng,
-        "timestamp_ms": int(loc.get("timestamp", 0)),
-        "device_id": device_id,
+        "timestamp_ms": int(d.get("timestamp", 0)),
+        "device_id": device_ref.id,
+        "user_doc": user_ref.id,
     }
+
+# -------------------------------
+# Icon loader (Base64 / file / URL)
+# -------------------------------
+def icon_path_from_secrets(prefix: str) -> str | None:
+    """
+    Priority:
+      1) {PREFIX}_ICON_BASE64    (data:... or raw base64)
+      2) {PREFIX}_ICON_FILE      (local path in app)
+      3) {PREFIX}_ICON_URL       (public URL)
+    Returns a filesystem path (temp file) or URL usable by folium.CustomIcon.
+    """
+    # 1) Base64
+    key_b64 = f"{prefix}_ICON_BASE64"
+    if key_b64 in S and S[key_b64]:
+        b64 = S[key_b64]
+        if "," in b64:  # strip "data:image/..;base64,"
+            b64 = b64.split(",", 1)[1]
+        img = base64.b64decode(b64)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+        tmp.write(img); tmp.flush()
+        return tmp.name
+
+    # 2) File path
+    key_file = f"{prefix}_ICON_FILE"
+    if key_file in S and S[key_file]:
+        return S[key_file]
+
+    # 3) URL
+    key_url = f"{prefix}_ICON_URL"
+    if key_url in S and S[key_url]:
+        return S[key_url]
+
+    return None
+
+# -------------------------------
+# Profiles (Tom, Mom, Jerry)
+# -------------------------------
+PROFILES = [
+    {
+        "display": "Tom",
+        "email": S.get("SUPER_ADMIN_EMAIL", "").strip(),
+        "icon_path": icon_path_from_secrets("TOM"),
+        "force_device": S.get("SUPER_ADMIN_DEVICE_ID","").strip() or None,
+    },
+    {
+        "display": "Tom’s mom",
+        "email": S.get("SUJATHA_EMAIL", "").strip(),
+        "icon_path": icon_path_from_secrets("MOM"),
+        "force_device": S.get("SUJATHA_DEVICE_ID","").strip() or None,
+    },
+    {
+        "display": "Jerry",
+        "email": S.get("JYOTHSNA_EMAIL", "").strip(),
+        "icon_path": icon_path_from_secrets("JERRY"),
+        "force_device": S.get("JYOTHSNA_DEVICE_ID","").strip() or None,
+    },
+]
 
 # -------------------------------
 # UI
 # -------------------------------
-header_left, header_right = st.columns([0.66, 0.34])
+left, right = st.columns([0.62, 0.38])
+with left:
+    st.markdown("## 👨‍👩‍👧 Family Live Locations")
 
-with header_left:
-    st.markdown("## 🧭 My Live Location")
+# Fetch all latest points
+results = []
+with st.spinner("Contacting Firestore…"):
+    for p in PROFILES:
+        if not p["email"]:
+            continue
+        info = fetch_latest_location(p["email"], p["force_device"])
+        if info:
+            info["display"] = p["display"]
+            info["icon_path"] = p["icon_path"]
+            results.append(info)
 
-with header_right:
+if not results:
+    st.error("No locations found. Check emails, Firestore paths, or device data.")
+    st.stop()
+
+# Right header: last updated list (IST)
+with right:
+    lines = []
+    for r in results:
+        lines.append(f"<div><b>{r['display']}</b>: {ms_to_ist(r['timestamp_ms'])}</div>")
     st.markdown(
-        "<div style='text-align:right; opacity:0.85;'>Auto-refresh: every 2 minutes</div>",
+        "<div style='text-align:right; font-size:1rem'>" +
+        "<div><i>Auto-refresh: every 2 minutes</i></div>" +
+        "".join(lines) +
+        "</div>",
         unsafe_allow_html=True,
     )
 
-if not USER_EMAIL:
-    st.error("SUPER_ADMIN_EMAIL is missing in secrets.")
-    st.stop()
+# Build map with all markers
+# Start centered on first; fit bounds to all markers
+m = folium.Map(location=[results[0]["lat"], results[0]["lng"]],
+               zoom_start=14, tiles="OpenStreetMap", control_scale=True)
 
-with st.spinner("Fetching latest location from Firestore…"):
-    latest = fetch_latest_location(USER_EMAIL)
+bounds = []
+for r in results:
+    popup_html = (
+        f"<b>{r['display']}</b><br>"
+        f"Lat: {r['lat']:.6f}, Lng: {r['lng']:.6f}<br>"
+        f"Updated: {ms_to_ist(r['timestamp_ms'])}<br>"
+        f"Device: {r['device_id']}"
+    )
+    icon = None
+    try:
+        if r["icon_path"]:
+            icon = folium.CustomIcon(r["icon_path"], icon_size=(48, 48))
+    except Exception:
+        icon = None
 
-if not latest:
-    st.error("No location found. Check Firestore paths/fields and your email in secrets.")
-    st.stop()
+    folium.Marker(
+        location=[r["lat"], r["lng"]],
+        tooltip=r["display"],
+        popup=popup_html,
+        icon=icon if icon else folium.Icon(color="red", icon="user", prefix="fa"),
+    ).add_to(m)
+    bounds.append([r["lat"], r["lng"]])
 
-# Last updated (IST) in the top-right
-last_updated = ms_to_ist_str(latest["timestamp_ms"])
-st.markdown(
-    f"""
-    <div style="text-align:right; font-size:1rem; margin-top:-0.5rem;">
-      <strong>Last updated:</strong> {last_updated}
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+if len(bounds) > 1:
+    m.fit_bounds(bounds, padding=(30, 30))
 
-# -------------------------------
-# Map rendering
-# -------------------------------
-lat, lng = latest["lat"], latest["lng"]
-
-m = folium.Map(
-    location=[lat, lng],
-    zoom_start=16,
-    tiles="OpenStreetMap",
-    control_scale=True,
-)
-
-# Tom icon if provided; else a standard user marker
-try:
-    if TOM_ICON_URL:
-        icon = folium.CustomIcon(TOM_ICON_URL, icon_size=(48, 48))
-        folium.Marker([lat, lng], icon=icon, tooltip="You are here").add_to(m)
-    else:
-        folium.Marker(
-            [lat, lng],
-            tooltip="You are here",
-            icon=folium.Icon(color="red", icon="user", prefix="fa"),
-        ).add_to(m)
-except Exception:
-    folium.Marker([lat, lng], tooltip="You are here").add_to(m)
-
-st_folium(m, height=520, width=None)
-st.caption(f"Device: {latest['device_id']}")
-
-st.markdown(
-    "<div style='text-align:center; opacity:0.6; font-size:0.9rem;'>"
-    "Data source: Firestore · Tiles: OpenStreetMap"
-    "</div>",
-    unsafe_allow_html=True,
-)
+st_folium(m, height=540, width=None)
+st.caption("All times shown in IST · Data: Firestore · Tiles: OpenStreetMap")
